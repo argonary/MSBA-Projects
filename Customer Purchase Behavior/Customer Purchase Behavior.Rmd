@@ -1,0 +1,290 @@
+---
+title: "Customer Purchase Behavior"
+output: pdf_document
+date: "2024-07-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r loading all the libraries, echo=TRUE}
+library(caret)
+library(randomForest)
+library(tidyverse)
+library(tree)
+library(gbm)
+library(rpart)
+library(rpart.plot)
+library(ggplot2)
+library(MLmetrics)
+library(MLeval)
+```
+
+```{r loading data, echo=TRUE}
+customers <- read.csv("C:/Users/argon/Documents/Desktop Prime/MS Business Analytics/Summer Semester/STA S380/Group Project/customer_purchase_data.csv")
+colnames(customers)
+glimpse(customers)
+```
+
+```{r checking duplicates, echo=TRUE}
+unique_customers <- customers %>% 
+  distinct()
+glimpse(unique_customers)
+summary(unique_customers)
+```
+
+```{r Basic Transformations, echo = TRUE}
+BreakPointsDiscounts <- c(2)
+BreakPointsTimeSpent <- c(-Inf, 29, Inf)
+breakpoints <- c(-Inf, 40, Inf)
+
+unique_customers <- unique_customers%>% 
+  mutate(
+    Gender = as.factor(unique_customers$Gender),
+    ProductCategory = as.factor(unique_customers$ProductCategory),
+    LoyaltyProgram = as.factor(unique_customers$LoyaltyProgram),
+    PurchaseStatus = factor(unique_customers$PurchaseStatus,levels = c(1, 0),labels = c("Yes", "No")),
+    AnnualIncome = log(unique_customers$AnnualIncome),
+    LoyaltyDiscInteraction = as.integer(unique_customers$LoyaltyProgram)*unique_customers$DiscountsAvailed,
+    CatDiscountsAvailed = cut(unique_customers$DiscountsAvailed,
+                              breaks = BreakPointsDiscounts, 
+                              labels = as.factor(c('Low Discounts Availed', 'High Discounts Availed')))
+  )
+
+glimpse(unique_customers)
+
+```
+
+```{r creating partition, echo = TRUE}
+set.seed(702)
+train_ix = createDataPartition(unique_customers$PurchaseStatus, p=0.8)
+
+unique_customers_train <- unique_customers[train_ix$Resample1,]
+unique_customers_test <- unique_customers[-train_ix$Resample1,]
+train_ix
+```
+
+```{r Setting Up Cross-Validation, echo = TRUE}
+set.seed(702)
+kcv <- 10
+cv_folds <- createFolds(unique_customers_train$PurchaseStatus,
+                        k = kcv)
+
+my_summary = function(data, lev = NULL, model = NULL){
+  default = defaultSummary(data, lev, model)
+  twoclass = twoClassSummary(data, lev, model)
+
+  twoclass[3] = 1 - twoclass[3]
+  names(twoclass) = c('AUC_ROC', 'TPR', 'FPR')
+  logloss = mnLogLoss(data, lev, model)
+  c(default, twoclass, logloss)
+}
+
+fit_control <- trainControl(
+  method = 'cv',
+  indexOut = cv_folds,
+
+  classProbs = TRUE,
+  savePredictions = TRUE,
+  summaryFunction = my_summary,
+  selectionFunction = 'oneSE'
+)
+```
+
+```{r Boosting Fitting, echo = TRUE}
+set.seed(702)
+gbm_grid <- expand.grid(
+  interaction.depth= c(7, 10, 12),
+  n.trees = c(100,150,200,300),
+  shrinkage = c(0.15, 0.2, 0.25),
+  n.minobsinnode = c(5,7,10) 
+)
+
+gbmfit <- train(
+  PurchaseStatus~.-ProductCategory, data = unique_customers_train,
+  method = 'gbm',
+  trControl = fit_control,
+  tuneGrid = gbm_grid,
+  metric = 'logLoss',
+  verbose = FALSE
+)
+
+gbmfit
+```
+
+```{r Boosting Plot, echo=TRUE}
+set.seed(702)
+plot(gbmfit)
+```
+
+```{r Boosting Confusion Matrix, echo = TRUE}
+set.seed(702)
+confusionMatrix(gbmfit)
+```
+
+```{r Boosting Thresholder, echo = TRUE}
+set.seed(702)
+thresholder(
+            gbmfit,
+            threshold = 0.5,
+            final = TRUE,
+            statistics = c('Sensitivity',
+                           'Specificity')
+            )
+```
+
+```{r gbmfit_res, echo = TRUE}
+set.seed(702)
+gbmfit_res = thresholder(gbmfit,
+                         threshold = seq(0.0005, 1, by = 0.005),
+                         final = TRUE)
+gbmfit_res
+```
+
+```{r pldf, echo = TRUE}
+set.seed(702)
+pldf = gbmfit_res %>% 
+  mutate(TPR = Sensitivity, FPR = 1 - Specificity, FNR = 1 - Sensitivity) %>% 
+  dplyr::select(-c(n.trees, interaction.depth, shrinkage, n.minobsinnode)) %>% 
+  pivot_longer(-prob_threshold)
+```
+
+```{r pldf plots, echo = TRUE}
+set.seed(702)
+ggplot(aes(x=prob_threshold, y=value, color = name),
+       data = pldf %>% filter(name %in% c('TPR', 'FPR'))) +
+  geom_line()
+
+ggplot(aes(x=prob_threshold, y= value, color = name),
+       data = pldf %>% filter(name %in% c('FNR', 'FPR'))) + 
+  geom_line()
+```
+
+```{r new threshold, echo=TRUE}
+set.seed(702)
+thres = 0.1
+
+tp = gbmfit_res %>% 
+  dplyr::filter(prob_threshold==thres) %>% 
+  dplyr::select(prob_threshold, Sensitivity, Specificity) %>% 
+  mutate(TPR = Sensitivity, FPR = 1-Specificity)
+```
+
+```{r new threshold pplot, echo = TRUE}
+set.seed(702)
+ggplot(aes(x=prob_threshold, y=value, color = name),
+       data = pldf %>% filter(name %in% c('TPR','FPR'))) + 
+  geom_line() +
+  geom_vline(xintercept = thres, lty = 2) +
+  geom_point(aes(x=prob_threshold, y=TPR, color = NULL), data = tp) +
+  geom_point(aes(x=prob_threshold, y = FPR, color = NULL), data = tp)
+
+```
+
+```{r ROC Curve 1, echo = TRUE}
+set.seed(702)
+optim_J = gbmfit_res[which.max(gbmfit_res$J),]
+
+ggplot(aes(x=prob_threshold, y=J),
+       data = gbmfit_res) + 
+  geom_line() + 
+  geom_vline(aes(xintercept = optim_J$prob_threshold), lty = 2)
+
+ggplot(aes(x=1 - Specificity, y = Sensitivity), data = gbmfit_res) + 
+  geom_line() + 
+  ylab('TPR (Sensitivity)') +
+  xlab('FPR (1-Specificity)') +
+  geom_abline(intercept = 0, slope = 1, linetype = 'dotted') + 
+  geom_segment(aes(x = 1-Specificity, xend=1-Specificity, y = Sensitivity, yend = Sensitivity), color = 'darkred', data = optim_J) + theme_bw()
+```
+
+```{r PR Curve, echo = TRUE}
+set.seed(702)
+ggplot(aes(x=prob_threshold, y=value, color = name),
+       data=pldf %>% filter(name %in% c('Precision','Recall')))+
+  geom_line()
+
+ggplot(aes(x=Recall, y = Precision), data = gbmfit_res) + 
+  geom_point() + 
+  geom_line() +
+  ylab('Precision') +
+  xlab('Recall (TPR)') +
+  geom_point(aes(x=Recall, y=Precision), color = 'darkred', data = optim_J) +
+  theme_bw()
+
+```
+
+```{r Lift Curve, echo=TRUE}
+set.seed(702)
+best_pars = gbmfit$bestTune
+best_preds = gbmfit$pred %>% filter(n.trees==best_pars$n.trees, interaction.depth==best_pars$interaction.depth)
+
+gbm_lift = caret::lift(obs~Yes, data = best_preds)
+```
+
+```{r Lift Curve Plotting, echo = TRUE}
+set.seed(702)
+ggplot(gbm_lift) + 
+  geom_abline(slope = 1, linetype = "dotted") + 
+  xlim(c(0,100)) + 
+  theme_bw()
+```
+
+```{r Calibration Plots, echo = TRUE}
+set.seed(702)
+gbm_cal = caret:: calibration(obs~Yes, data = best_preds, cuts = 7)
+ggplot(gbm_cal) + theme_bw()
+```
+
+```{r Holdout Set Results Initial Test, echo = TRUE}
+set.seed(702)
+test_probs = predict(gbmfit, newdata = unique_customers_test, type='prob')
+
+test_preds <- factor(ifelse(test_probs[, "Yes"] > optim_J$prob_threshold, "Yes", "No"))
+test_conf_matrix = predict(gbmfit, newdata = unique_customers_test)
+
+test_conf_matrix
+
+print(confusionMatrix(test_preds, unique_customers_test$PurchaseStatus))
+
+
+get_metrics = function(threshold, test_probs, true_class, 
+                       pos_label, neg_label){
+  pc = factor(ifelse(test_probs[pos_label]>threshold, pos_label, neg_label), levels=c(pos_label, neg_label))
+  test_set = data.frame(obs= true_class, pred=pc, test_probs)
+  my_summary(test_set, lev= c(pos_label, neg_label))
+}
+
+get_metrics(optim_J$prob_threshold, test_probs, unique_customers_test$PurchaseStatus, 'Yes', 'No')
+
+
+thr_seq = seq(0,1, length.out = 500)
+metrics = lapply(thr_seq, function(x) get_metrics(x, test_probs, unique_customers_test$PurchaseStatus, 'Yes', 'No'))
+metrics_df = data.frame(do.call(rbind, metrics))
+varImp(gbmfit)
+```
+
+```{r ROC Curve, echo = TRUE}
+ggplot(aes(x=FPR, y = TPR), data = metrics_df) +
+  geom_line() +
+  ylab('TPR (Sensitivity)') +
+  xlab('FPR (1-Specificity)') +
+  geom_abline(intercept = 0, slope = 1, linetype = 'dotted') + 
+  annotate('text', x=0.75, y=0.25, label = paste('AUC:', round(metrics_df$AUC_ROC[1], 2)))
+```
+
+```{r Lift, echo = TRUE}
+gbm_oos_lift = caret::lift(unique_customers_test$PurchaseStatus~test_probs[,1])
+
+ggplot(gbm_oos_lift) +
+  geom_abline(slope = 1, linetype ='dotted') +
+  xlim(c(0,100)) + 
+  theme_bw()
+```
+
+```{r Calibration, echo=TRUE}
+gbm_cal = caret::calibration(unique_customers_test$PurchaseStatus~test_probs[,1], data = best_preds, cuts = 7)
+
+ggplot(gbm_cal) + theme_bw()
+```
